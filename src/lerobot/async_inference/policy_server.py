@@ -86,6 +86,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
+        self.obs_similarity_atol = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -147,6 +148,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.obs_similarity_atol = policy_specs.obs_similarity_atol
 
         policy_class = get_policy_class(self.policy_type)
 
@@ -268,7 +270,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
-        """Check if the observation is valid to be processed by the policy"""
+        """Check if the observation is valid to be processed by the policy.
+        Filtering can be configured via obs_similarity_atol:
+        - None: Disable similarity check entirely (only timestep check applies)
+        - float > 0: Filter observations within this L2 norm tolerance of previous
+        """
         with self._predicted_timesteps_lock:
             predicted_timesteps = self._predicted_timesteps
 
@@ -276,7 +282,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
 
-        elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
+        # Skip similarity check if disabled (obs_similarity_atol is None)
+        elif self.obs_similarity_atol is not None and observations_similar(
+            obs, previous_obs, lerobot_features=self.lerobot_features, atol=self.obs_similarity_atol
+        ):
             self.logger.debug(
                 f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
             )
