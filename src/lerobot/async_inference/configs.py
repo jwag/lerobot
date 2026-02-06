@@ -142,6 +142,15 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Observation filtering configuration
+    obs_similarity_atol: float | None = field(
+        default=1.0,
+        metadata={
+            "help": "Tolerance for observation similarity check (L2 norm of state difference). "
+            "Set to None to disable similarity filtering entirely."
+        },
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -190,4 +199,5 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "obs_similarity_atol": self.obs_similarity_atol,
         }
