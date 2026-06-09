@@ -144,6 +144,85 @@ class SharpnessJitter(Transform):
         return self._call_kernel(F.adjust_sharpness, inpt, sharpness_factor=sharpness_factor)
 
 
+class ImageDropout(Transform):
+    """Randomly drop (zero out) images during training to improve robustness.
+
+    This transform is useful for improving policy robustness to camera failures and occlusions.
+    When an image is dropped, it is replaced with a tensor of all zeros (black pixels), maintaining
+    the original image dimensions.
+
+    Supports both uniform dropout (single probability for all cameras) and per-camera dropout
+    (different probability for each camera). This transform follows the standard PyTorch Transform
+    API and is applied per-image by the dataset loader.
+
+    If the input is a :class:`torch.Tensor`,
+    it is expected to have [..., C, H, W] shape, where ... means an arbitrary number of leading dimensions.
+
+    Args:
+        dropout_probs: Dropout probability configuration. Can be:
+            - float: Uniform probability applied to all cameras (e.g., 0.2 for 20% dropout)
+            - dict[str, float]: Per-camera probabilities (e.g., {"image": 0.1, "image2": 0.25})
+            All probabilities must be in [0.0, 1.0].
+
+    Examples:
+        >>> # Uniform 20% dropout for all cameras
+        >>> dropout = ImageDropout(dropout_probs=0.2)
+        >>> 
+        >>> # Per-camera dropout rates
+        >>> dropout = ImageDropout(dropout_probs={"image": 0.1, "image2": 0.25, "image3": 0.25})
+    """
+
+    def __init__(self, dropout_probs: dict[str, float] | float = 0.2) -> None:
+        super().__init__()
+        
+        # Validate and store dropout probabilities
+        if isinstance(dropout_probs, (int, float)):
+            if not 0.0 <= dropout_probs <= 1.0:
+                raise ValueError(f"dropout_probs must be in [0.0, 1.0], got {dropout_probs}")
+            self.dropout_probs = float(dropout_probs)
+            self.uniform = True
+        elif isinstance(dropout_probs, dict):
+            for cam_name, prob in dropout_probs.items():
+                if not isinstance(prob, (int, float)):
+                    raise TypeError(f"Probability for camera '{cam_name}' must be a number, got {type(prob)}")
+                if not 0.0 <= prob <= 1.0:
+                    raise ValueError(f"Probability for camera '{cam_name}' must be in [0.0, 1.0], got {prob}")
+            self.dropout_probs = {k: float(v) for k, v in dropout_probs.items()}
+            self.uniform = False
+        else:
+            raise TypeError(f"dropout_probs must be a number or dict, got {type(dropout_probs)}")
+
+
+    def forward(self, inpt: Any, camera_name: str | None = None) -> Any:
+        """Apply dropout to the input.
+        
+        Args:
+            inpt: Input tensor(s) following the torchvision Transform API
+            camera_name: Name of the camera (required for per-camera dropout, optional for uniform)
+            
+        Returns:
+            Input tensor(s), potentially zeroed out based on dropout probability
+        """
+        # Determine the dropout probability for this camera
+        if self.uniform:
+            dropout_prob = self.dropout_probs
+        else:
+            if camera_name is None:
+                raise ValueError("camera_name is required when using per-camera dropout probabilities")
+            dropout_prob = self.dropout_probs.get(camera_name, 0.0)
+        
+        # Skip if dropout probability is 0
+        if dropout_prob == 0.0:
+            return inpt
+        
+        # Generate random value and decide whether to drop
+        if torch.rand(1).item() < dropout_prob:
+            # Zero out the entire image/tensor
+            return torch.zeros_like(inpt)
+        
+        return inpt
+
+
 @dataclass
 class ImageTransformConfig:
     """
@@ -179,6 +258,14 @@ class ImageTransformsConfig:
     # By default, transforms are applied in Torchvision's suggested order (shown below).
     # Set this to True to apply them in a random order.
     random_order: bool = False
+    # Image dropout configuration: randomly zero out images during training
+    # Set to True to enable image dropout augmentation (improves robustness to camera failures)
+    image_dropout_enable: bool = False
+    # Dropout probability: can be uniform (float) or per-camera (dict[str, float])
+    # Uniform example: 0.2 means 20% chance for all cameras
+    # Per-camera example: {"image": 0.1, "image2": 0.25} for different rates per camera
+    # All probabilities must be in [0.0, 1.0].
+    image_dropout_prob: dict[str, float] | float = 0.2
     tfs: dict[str, ImageTransformConfig] = field(
         default_factory=lambda: {
             "brightness": ImageTransformConfig(
@@ -224,6 +311,8 @@ def make_transform_from_config(cfg: ImageTransformConfig):
         return SharpnessJitter(**cfg.kwargs)
     elif cfg.type == "RandomAffine":
         return v2.RandomAffine(**cfg.kwargs)
+    elif cfg.type == "ImageDropout":
+        return ImageDropout(**cfg.kwargs)
     else:
         raise ValueError(f"Transform '{cfg.type}' is not valid.")
 
@@ -255,5 +344,19 @@ class ImageTransforms(Transform):
                 random_order=cfg.random_order,
             )
 
-    def forward(self, *inputs: Any) -> Any:
-        return self.tf(*inputs)
+        # Create image dropout transform if enabled
+        # Dropout is applied after other transforms (augment first, then potentially drop)
+        if cfg.image_dropout_enable and cfg.enable:
+            self.dropout = ImageDropout(dropout_probs=cfg.image_dropout_prob)
+        else:
+            self.dropout = None
+
+    def forward(self, *inputs: Any, camera_name: str | None = None) -> Any:
+        # Apply standard transforms
+        outputs = self.tf(*inputs)
+        
+        # Apply dropout if enabled (after other transforms)
+        if self.dropout is not None:
+            outputs = self.dropout(outputs, camera_name=camera_name)
+        
+        return outputs
