@@ -32,6 +32,7 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -70,7 +71,9 @@ class DiffusionPolicy(PreTrainedPolicy):
         self.config = config
 
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
-        self._queues = None
+        self._queues = None    
+        self._history_buffer = None
+        self.n_obs_steps = self.config.n_obs_steps 
 
         self.diffusion = DiffusionModel(config)
 
@@ -90,14 +93,36 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
-    @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
-        # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+    @torch.no_grad()     
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        # 1. Add a sequence dimension (s=1) to the incoming single observation
+        if batch['observation.state'].ndim == 2:
+            batch['observation.state'] = batch['observation.state'].unsqueeze(1)
+        
+        image_list = [batch[key].unsqueeze(1) for key in self.config.image_features]
+        batch['observation.images'] = torch.stack(image_list, dim=2) # Shape [B, 1, N, C, H, W]
 
+        # 2. Initialize or update the history buffer
+        if self._history_buffer is None:
+            # On the first step, fill the buffer by repeating the current observation
+            self._history_buffer = {
+                'observation.state': batch['observation.state'].repeat(1, self.n_obs_steps, 1),
+                'observation.images': batch['observation.images'].repeat(1, self.n_obs_steps, 1, 1, 1, 1)
+            }
+        else:
+            # Slide the window: remove the oldest and append the newest
+            self._history_buffer['observation.state'] = torch.cat(
+                [self._history_buffer['observation.state'][:, 1:], batch['observation.state']], dim=1
+            )
+            self._history_buffer['observation.images'] = torch.cat(
+                [self._history_buffer['observation.images'][:, 1:], batch['observation.images']], dim=1
+            )
+
+    # 3. Call the model with the correctly shaped history
+    # The `self._history_buffer` now contains a batch with the sequence dimension equal to `n_obs_steps`
+        actions = self.diffusion.generate_actions(self._history_buffer)
         return actions
+    
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -140,8 +165,12 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
+
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            for key in self.config.image_features:
+                if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
+                    batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
@@ -194,7 +223,7 @@ class DiffusionModel(nn.Module):
         )
 
         if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+            self.num_inference_steps = 20
         else:
             self.num_inference_steps = config.num_inference_steps
 
@@ -233,6 +262,7 @@ class DiffusionModel(nn.Module):
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
+        sample = torch.clamp(sample, -self.config.clip_sample_range, self.config.clip_sample_range)
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
@@ -285,11 +315,10 @@ class DiffusionModel(nn.Module):
         }
         """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        assert n_obs_steps == self.config.n_obs_steps
-
+        n_obs_steps = self.config.n_obs_steps
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-
+        # (global_cond)
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
 
@@ -361,7 +390,9 @@ class DiffusionModel(nn.Module):
                     f"{self.config.do_mask_loss_for_padding=}."
                 )
             in_episode_bound = ~batch["action_is_pad"]
-            loss = loss * in_episode_bound.unsqueeze(-1)
+            mask = in_episode_bound.unsqueeze(-1)
+            num_valid = mask.sum() * loss.shape[-1]
+            return (loss * mask).sum() / num_valid.clamp_min(1)
 
         return loss.mean()
 
@@ -446,6 +477,11 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
+        if config.resize_shape is not None:
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.resize = None
+
         if config.crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
@@ -483,7 +519,13 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        # dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        elif config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
@@ -500,6 +542,9 @@ class DiffusionRgbEncoder(nn.Module):
             (B, D) image feature.
         """
         # Preprocess: maybe crop (if it was set up in the __init__).
+        if self.resize is not None:
+            x = self.resize(x)
+
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
@@ -682,22 +727,34 @@ class DiffusionConditionalUnet1d(nn.Module):
         else:
             global_feature = timesteps_embed
 
+        use_gc = self.config.gradient_checkpointing and self.training
+
         # Run encoder, keeping track of skip features to pass to the decoder.
         encoder_skip_features: list[Tensor] = []
         for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
+            if use_gc:
+                x = checkpoint(resnet, x, global_feature, use_reentrant=False)
+                x = checkpoint(resnet2, x, global_feature, use_reentrant=False)
+            else:
+                x = resnet(x, global_feature)
+                x = resnet2(x, global_feature)
             encoder_skip_features.append(x)
             x = downsample(x)
 
         for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
-
+            if use_gc:
+                x = checkpoint(mid_module, x, global_feature, use_reentrant=False)
+            else:
+                x = mid_module(x, global_feature)
         # Run decoder, using the skip features from the encoder.
         for resnet, resnet2, upsample in self.up_modules:
             x = torch.cat((x, encoder_skip_features.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
+            if use_gc:
+                x = checkpoint(resnet, x, global_feature, use_reentrant=False)
+                x = checkpoint(resnet2, x, global_feature, use_reentrant=False)
+            else:
+                x = resnet(x, global_feature)
+                x = resnet2(x, global_feature)
             x = upsample(x)
 
         x = self.final_conv(x)

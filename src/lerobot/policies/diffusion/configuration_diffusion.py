@@ -123,6 +123,8 @@ class DiffusionConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    resize_shape: tuple[int, int] | None = None
+    crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
@@ -135,8 +137,9 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+    gradient_checkpointing: bool = False
     # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
+    noise_scheduler_type: str = "DDIM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
     beta_start: float = 0.0001
@@ -147,6 +150,10 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+
+    # Optimization
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
@@ -227,7 +234,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        return list(range(1 - self.n_obs_steps-.1, 1.1))
 
     @property
     def action_delta_indices(self) -> list:
