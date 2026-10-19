@@ -65,6 +65,7 @@ class SmolVLMWithExpertModel(nn.Module):
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
         freeze_vision_encoder: bool = False,
+        freeze_language_model: bool = False,
         attention_mode: str = "self_attn",
         num_expert_layers: int = -1,
         num_vlm_layers: int = -1,
@@ -128,6 +129,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
 
         self.freeze_vision_encoder = freeze_vision_encoder
+        self.freeze_language_model = freeze_language_model
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
@@ -146,23 +148,31 @@ class SmolVLMWithExpertModel(nn.Module):
             for params in self.vlm.parameters():
                 params.requires_grad = False
         else:
-            # To avoid unused params issue with distributed training
-            last_layers = [self.num_vlm_layers - 1]
-            if (
-                self.num_vlm_layers != self.num_expert_layers
-                and self.num_vlm_layers % self.num_expert_layers == 0
-            ):
-                last_layers.append(self.num_vlm_layers - 2)
-            frozen_layers = [
-                "lm_head",
-                "text_model.model.norm.weight",
-            ]
-            for layer in last_layers:
-                frozen_layers.append(f"text_model.model.layers.{layer}.")
-
-            for name, params in self.vlm.named_parameters():
-                if any(k in name for k in frozen_layers):
+            if self.freeze_language_model:
+                self.get_vlm_model().text_model.eval()
+                for params in self.get_vlm_model().text_model.parameters():
                     params.requires_grad = False
+                self.vlm.lm_head.eval()
+                for params in self.vlm.lm_head.parameters():
+                    params.requires_grad = False
+            else:
+                # To avoid unused params issue with distributed training
+                last_layers = [self.num_vlm_layers - 1]
+                if (
+                    self.num_vlm_layers != self.num_expert_layers
+                    and self.num_vlm_layers % self.num_expert_layers == 0
+                ):
+                    last_layers.append(self.num_vlm_layers - 2)
+                frozen_layers = [
+                    "lm_head",
+                    "text_model.model.norm.weight",
+                ]
+                for layer in last_layers:
+                    frozen_layers.append(f"text_model.model.layers.{layer}.")
+
+                for name, params in self.vlm.named_parameters():
+                    if any(k in name for k in frozen_layers):
+                        params.requires_grad = False
         # To avoid unused params issue with distributed training
         for name, params in self.lm_expert.named_parameters():
             if "lm_head" in name:
@@ -176,6 +186,9 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if self.train_expert_only:
             self.vlm.eval()
+        elif self.freeze_language_model:
+            self.get_vlm_model().text_model.eval()
+            self.vlm.lm_head.eval()
 
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None

@@ -559,6 +559,7 @@ class VLAFlowMatching(nn.Module):
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
+            freeze_language_model=self.config.freeze_language_model,
             train_expert_only=self.config.train_expert_only,
             load_vlm_weights=self.config.load_vlm_weights,
             attention_mode=self.config.attention_mode,
