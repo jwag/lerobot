@@ -95,6 +95,14 @@ class RandomSubsetApply(Transform):
         )
 
 
+CAMERA_KEY_PREFIX = "observation.images."
+
+
+def short_camera_name(name: str) -> str:
+    """Strip the ``observation.images.`` prefix so cameras can be named either way in configs."""
+    return name[len(CAMERA_KEY_PREFIX) :] if name.startswith(CAMERA_KEY_PREFIX) else name
+
+
 class SharpnessJitter(Transform):
     """Randomly change the sharpness of an image or video.
 
@@ -187,7 +195,8 @@ class ImageDropout(Transform):
                     raise TypeError(f"Probability for camera '{cam_name}' must be a number, got {type(prob)}")
                 if not 0.0 <= prob <= 1.0:
                     raise ValueError(f"Probability for camera '{cam_name}' must be in [0.0, 1.0], got {prob}")
-            self.dropout_probs = {k: float(v) for k, v in dropout_probs.items()}
+            # Keys may be full feature keys ("observation.images.image") or short names ("image").
+            self.dropout_probs = {short_camera_name(k): float(v) for k, v in dropout_probs.items()}
             self.uniform = False
         else:
             raise TypeError(f"dropout_probs must be a number or dict, got {type(dropout_probs)}")
@@ -209,7 +218,7 @@ class ImageDropout(Transform):
         else:
             if camera_name is None:
                 raise ValueError("camera_name is required when using per-camera dropout probabilities")
-            dropout_prob = self.dropout_probs.get(camera_name, 0.0)
+            dropout_prob = self.dropout_probs.get(short_camera_name(camera_name), 0.0)
         
         # Skip if dropout probability is 0
         if dropout_prob == 0.0:
@@ -262,10 +271,16 @@ class ImageTransformsConfig:
     # Set to True to enable image dropout augmentation (improves robustness to camera failures)
     image_dropout_enable: bool = False
     # Dropout probability: can be uniform (float) or per-camera (dict[str, float])
-    # Uniform example: 0.2 means 20% chance for all cameras
+    # Uniform example: 0.2 means a 20 percent chance for all cameras
     # Per-camera example: {"image": 0.1, "image2": 0.25} for different rates per camera
     # All probabilities must be in [0.0, 1.0].
     image_dropout_prob: dict[str, float] | float = 0.2
+    # Cameras that the `tfs` augmentations (color jitter, sharpness, affine, ...) are applied to.
+    # None (default) applies them to every camera. Names may be full feature keys
+    # ("observation.images.image") or short names ("image"). Image dropout is configured
+    # separately via `image_dropout_prob` and is not affected by this list.
+    # CLI example: --dataset.image_transforms.transform_camera_keys="[image]"
+    transform_camera_keys: list[str] | None = None
     tfs: dict[str, ImageTransformConfig] = field(
         default_factory=lambda: {
             "brightness": ImageTransformConfig(
@@ -351,9 +366,46 @@ class ImageTransforms(Transform):
         else:
             self.dropout = None
 
+        self.transform_cameras = (
+            None
+            if cfg.transform_camera_keys is None
+            else {short_camera_name(k) for k in cfg.transform_camera_keys}
+        )
+
+    def applies_transforms_to(self, camera_name: str | None) -> bool:
+        """Whether the `tfs` augmentations run on this camera (always True if no camera filter is set)."""
+        if self.transform_cameras is None or camera_name is None:
+            return True
+        return short_camera_name(camera_name) in self.transform_cameras
+
+    def validate_camera_keys(self, camera_keys: Sequence[str]) -> None:
+        """Raise if the config names cameras that don't exist in the dataset.
+
+        Unmatched names would otherwise be silently ignored (e.g. 0% dropout, or no augmentation).
+        """
+        available = {short_camera_name(k) for k in camera_keys}
+        problems = []
+        if self.transform_cameras is not None:
+            unknown = sorted(self.transform_cameras - available)
+            if unknown:
+                problems.append(f"transform_camera_keys: {unknown}")
+        if self.dropout is not None and not self.dropout.uniform:
+            unknown = sorted(set(self.dropout.dropout_probs) - available)
+            if unknown:
+                problems.append(f"image_dropout_prob: {unknown}")
+        if problems:
+            raise ValueError(
+                "image_transforms config references cameras not in the dataset ("
+                + "; ".join(problems)
+                + f"). Dataset cameras: {sorted(camera_keys)}"
+            )
+
     def forward(self, *inputs: Any, camera_name: str | None = None) -> Any:
-        # Apply standard transforms
-        outputs = self.tf(*inputs)
+        # Apply standard transforms (only to selected cameras, if a camera filter is set)
+        if self.applies_transforms_to(camera_name):
+            outputs = self.tf(*inputs)
+        else:
+            outputs = inputs[0] if len(inputs) == 1 else inputs
         
         # Apply dropout if enabled (after other transforms)
         if self.dropout is not None:
