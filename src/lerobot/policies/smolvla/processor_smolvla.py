@@ -81,6 +81,7 @@ def make_smolvla_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
+            clip=config.normalization_clip,
         ),
     ]
     output_steps = [

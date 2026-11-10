@@ -80,6 +80,10 @@ class _NormalizationMixin:
             calculations.
         normalize_observation_keys: An optional set of keys to selectively apply
             normalization to specific observation features.
+        clip: Optional mapping from `FeatureType` to a bound `c`. After normalization, features of
+            that type are clamped to [-c, c]. Only applies to forward normalization (never to
+            unnormalization) and only to feature types that are actually normalized (not IDENTITY).
+            Useful with QUANTILES to keep rare outliers from producing huge inputs.
         _tensor_stats: An internal dictionary holding the normalization statistics as
             PyTorch tensors.
         _stats_explicitly_provided: Internal flag tracking whether stats were explicitly
@@ -93,6 +97,7 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    clip: dict[FeatureType, float] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -125,6 +130,19 @@ class _NormalizationMixin:
             for ft_type_str, norm_mode_str in self.norm_map.items():
                 reconstructed[FeatureType(ft_type_str)] = NormalizationMode(norm_mode_str)
             self.norm_map = reconstructed
+
+        # Normalize clip map: accept string keys (JSON / CLI) and drop empty maps.
+        if self.clip:
+            clip = {}
+            for ft_type, bound in self.clip.items():
+                ft_type = FeatureType(ft_type) if isinstance(ft_type, str) else ft_type
+                bound = float(bound)
+                if bound <= 0:
+                    raise ValueError(f"clip bound for {ft_type.value} must be > 0, got {bound}")
+                clip[ft_type] = bound
+            self.clip = clip
+        else:
+            self.clip = None
 
         # Convert stats to tensors and move to the target device once during initialization.
         self.stats = self.stats or {}
@@ -237,7 +255,18 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.clip:
+            config["clip"] = {ft_type.value: bound for ft_type, bound in self.clip.items()}
         return config
+
+    def _maybe_clip(self, tensor: Tensor, feature_type: FeatureType, inverse: bool) -> Tensor:
+        """Clamp a freshly normalized tensor to [-c, c] if a clip bound is configured for its type."""
+        if inverse or not self.clip or feature_type not in self.clip:
+            return tensor
+        if self.norm_map.get(feature_type, NormalizationMode.IDENTITY) == NormalizationMode.IDENTITY:
+            return tensor
+        bound = self.clip[feature_type]
+        return tensor.clamp(-bound, bound)
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
         """
@@ -257,7 +286,8 @@ class _NormalizationMixin:
             if feature.type != FeatureType.ACTION and key in new_observation:
                 # Convert to tensor but preserve original dtype for adaptation logic
                 tensor = torch.as_tensor(new_observation[key])
-                new_observation[key] = self._apply_transform(tensor, key, feature.type, inverse=inverse)
+                transformed = self._apply_transform(tensor, key, feature.type, inverse=inverse)
+                new_observation[key] = self._maybe_clip(transformed, feature.type, inverse)
         return new_observation
 
     def _normalize_action(self, action: Tensor, inverse: bool) -> Tensor:
@@ -273,7 +303,7 @@ class _NormalizationMixin:
             The transformed action tensor.
         """
         processed_action = self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
-        return processed_action
+        return self._maybe_clip(processed_action, FeatureType.ACTION, inverse)
 
     def _apply_transform(
         self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False

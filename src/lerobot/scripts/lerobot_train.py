@@ -264,6 +264,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
+                "clip": getattr(policy.config, "normalization_clip", None),
             },
         }
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {

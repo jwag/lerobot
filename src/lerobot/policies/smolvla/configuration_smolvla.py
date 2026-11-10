@@ -39,6 +39,11 @@ class SmolVLAConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+    # Optional clamp applied after normalization, keyed by feature type (like normalization_mapping).
+    # e.g. {"STATE": 5.0} clamps normalized state to [-5, 5]. Pairs well with STATE=QUANTILES to keep
+    # rare sensor glitches from producing huge inputs. Not applied when unnormalizing actions.
+    # CLI: --policy.normalization_clip='{"STATE": 5.0}'
+    normalization_clip: dict[str, float] | None = None
 
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
