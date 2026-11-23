@@ -593,6 +593,7 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+        self._denoise_graph_state: dict | None = None
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -827,10 +828,45 @@ class VLAFlowMatching(nn.Module):
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
+        # Hoist loop-invariant suffix masks & position_ids outside the Euler loop
+        suffix_masks_cache = self._build_denoise_masks(
+            prefix_pad_masks, dtype=self.action_in_proj.weight.dtype
+        )
+        full_att_2d_masks, position_ids = suffix_masks_cache
+
+        use_cuda_graph = (
+            getattr(self.config, "denoise_cuda_graph", False)
+            and device.type == "cuda"
+            and not torch.is_grad_enabled()
+            and not self._rtc_enabled()
+            and past_key_values is not None
+        )
+        if use_cuda_graph:
+            graph_state = self._get_or_capture_denoise_graph(
+                x_t=noise,
+                full_att_2d_masks=full_att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
+
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            if use_cuda_graph:
+                v_t = self._replay_denoise_graph(
+                    graph_state,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                    full_att_2d_masks=full_att_2d_masks,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                x_t = x_t + dt * v_t
+                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                    self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                continue
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -838,6 +874,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    suffix_masks_cache=suffix_masks_cache,
                 )
 
             if self._rtc_enabled():
@@ -863,14 +900,172 @@ class VLAFlowMatching(nn.Module):
 
         return x_t
 
+    def _build_denoise_masks(self, prefix_pad_masks: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """Precompute suffix attention mask and position IDs (invariant across Euler steps)."""
+        batch_size, prefix_len = prefix_pad_masks.shape
+        device = prefix_pad_masks.device
+        suffix_len = self.config.chunk_size
+
+        suffix_pad_masks = torch.ones(batch_size, suffix_len, dtype=torch.bool, device=device)
+        suffix_att_masks = torch.ones((batch_size, suffix_len), dtype=dtype, device=device)
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        return full_att_2d_masks, position_ids
+
+    def _denoise_step_core(
+        self,
+        full_att_2d_masks: Tensor,
+        position_ids: Tensor,
+        past_key_values: dict,
+        x_t: Tensor,
+        timestep: Tensor,
+    ) -> Tensor:
+        """Execute one denoising step given precomputed attention masks and position IDs."""
+        action_emb = self.action_in_proj(x_t)
+        device = action_emb.device
+        dtype = action_emb.dtype
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=device,
+        )
+        time_emb = time_emb.type(dtype=dtype)
+
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        suffix_embs = self.action_time_mlp_out(action_time_emb)
+
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)
+
+    def _get_or_capture_denoise_graph(
+        self,
+        x_t: Tensor,
+        full_att_2d_masks: Tensor,
+        position_ids: Tensor,
+        past_key_values: dict,
+    ) -> dict:
+        """Capture a CUDA graph for `_denoise_step_core` keyed on tensor shapes/dtypes/device."""
+        layer_keys = sorted(past_key_values.keys())
+        kv_sig = tuple(
+            (
+                k,
+                tuple(past_key_values[k]["key_states"].shape),
+                past_key_values[k]["key_states"].dtype,
+            )
+            for k in layer_keys
+        )
+        sig = (
+            tuple(x_t.shape),
+            x_t.dtype,
+            tuple(full_att_2d_masks.shape),
+            full_att_2d_masks.dtype,
+            tuple(position_ids.shape),
+            position_ids.dtype,
+            kv_sig,
+            str(x_t.device),
+        )
+        if self._denoise_graph_state is not None and self._denoise_graph_state["sig"] == sig:
+            return self._denoise_graph_state
+
+        bsize = x_t.shape[0]
+        static_x_t = x_t.clone()
+        static_timestep = torch.ones((bsize,), dtype=torch.float32, device=x_t.device)
+        static_masks = full_att_2d_masks.clone()
+        static_pos_ids = position_ids.clone()
+        static_kv = {
+            k: {
+                "key_states": past_key_values[k]["key_states"].clone(),
+                "value_states": past_key_values[k]["value_states"].clone(),
+            }
+            for k in layer_keys
+        }
+
+        # Warmup on a side stream before capture
+        s = torch.cuda.Stream(device=x_t.device)
+        s.wait_stream(torch.cuda.current_stream(device=x_t.device))
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = self._denoise_step_core(static_masks, static_pos_ids, static_kv, static_x_t, static_timestep)
+        torch.cuda.current_stream(device=x_t.device).wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_v_t = self._denoise_step_core(
+                static_masks, static_pos_ids, static_kv, static_x_t, static_timestep
+            )
+
+        self._denoise_graph_state = {
+            "sig": sig,
+            "graph": graph,
+            "layer_keys": layer_keys,
+            "static_x_t": static_x_t,
+            "static_timestep": static_timestep,
+            "static_masks": static_masks,
+            "static_pos_ids": static_pos_ids,
+            "static_kv": static_kv,
+            "static_v_t": static_v_t,
+        }
+        return self._denoise_graph_state
+
+    def _replay_denoise_graph(
+        self,
+        state: dict,
+        x_t: Tensor,
+        timestep: Tensor,
+        full_att_2d_masks: Tensor,
+        position_ids: Tensor,
+        past_key_values: dict,
+    ) -> Tensor:
+        state["static_x_t"].copy_(x_t)
+        state["static_timestep"].copy_(timestep)
+        state["static_masks"].copy_(full_att_2d_masks)
+        state["static_pos_ids"].copy_(position_ids)
+        for k in state["layer_keys"]:
+            state["static_kv"][k]["key_states"].copy_(past_key_values[k]["key_states"])
+            state["static_kv"][k]["value_states"].copy_(past_key_values[k]["value_states"])
+        state["graph"].replay()
+        return state["static_v_t"]
+
     def denoise_step(
         self,
         prefix_pad_masks,
         past_key_values,
         x_t,
         timestep,
+        suffix_masks_cache: tuple[Tensor, Tensor] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
+        if suffix_masks_cache is not None:
+            full_att_2d_masks, position_ids = suffix_masks_cache
+            return self._denoise_step_core(
+                full_att_2d_masks=full_att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                x_t=x_t,
+                timestep=timestep,
+            )
+
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
