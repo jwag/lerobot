@@ -24,6 +24,7 @@ python -m lerobot.async_inference.policy_server \
 ```
 """
 
+import gc
 import logging
 import pickle  # nosec
 import threading
@@ -150,11 +151,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.obs_similarity_atol = policy_specs.obs_similarity_atol
 
-        policy_class = get_policy_class(self.policy_type)
-
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
+        cache_key = (self.policy_type, policy_specs.pretrained_name_or_path, str(self.device))
+        if self.policy is None or getattr(self, "_cached_policy_key", None) != cache_key:
+            gc.unfreeze()
+            policy_class = get_policy_class(self.policy_type)
+            self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+            self.policy.to(self.device)
+            self.policy.eval()
+            self._cached_policy_key = cache_key
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -167,6 +172,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             },
             postprocessor_overrides={"device_processor": device_override},
         )
+        gc.collect()
+        gc.freeze()
 
         end = time.perf_counter()
 
@@ -373,21 +380,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """4. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
-
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        action_tensor = self.postprocessor(action_tensor).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
