@@ -74,7 +74,7 @@ class SmolVLAConfig(PreTrainedConfig):
     use_cache: bool = True
 
     # Inference performance
-    denoise_cuda_graph: bool = False
+    denoise_cuda_graph: bool = True
 
     # Finetuning settings
     freeze_vision_encoder: bool = True

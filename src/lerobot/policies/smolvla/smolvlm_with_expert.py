@@ -15,6 +15,7 @@
 import copy
 
 import torch
+import transformers.modeling_utils
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -84,10 +85,19 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             config = self.vlm.config
         else:
-            config = AutoConfig.from_pretrained(model_id)
-            self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        if num_vlm_layers > 0:
+            try:
+                config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+            except OSError:
+                config = AutoConfig.from_pretrained(model_id)
+            if num_vlm_layers > 0:
+                config.text_config.num_hidden_layers = num_vlm_layers
+            with transformers.modeling_utils.no_init_weights():
+                self.vlm = SmolVLMForConditionalGeneration(config=config)
+        try:
+            self.processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+        except OSError:
+            self.processor = AutoProcessor.from_pretrained(model_id)
+        if num_vlm_layers > 0 and len(self.get_vlm_model().text_model.layers) > num_vlm_layers:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
@@ -103,7 +113,11 @@ class SmolVLMWithExpertModel(nn.Module):
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
+        if not load_vlm_weights:
+            with transformers.modeling_utils.no_init_weights():
+                self.lm_expert = AutoModel.from_config(lm_expert_config)
+        else:
+            self.lm_expert = AutoModel.from_config(lm_expert_config)
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
