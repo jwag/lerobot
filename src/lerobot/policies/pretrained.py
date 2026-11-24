@@ -141,6 +141,8 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Add device parameter for newer versions that support it
         if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
             kwargs["device"] = map_location
+            if map_location and str(map_location) != "cpu":
+                model.to(map_location)
 
         # Load the model with appropriate kwargs
         missing_keys, unexpected_keys = load_model_as_safetensor(model, model_file, **kwargs)

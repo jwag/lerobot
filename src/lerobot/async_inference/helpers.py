@@ -76,6 +76,8 @@ def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, 
     # (H, W, C) -> (C, H, W) for resizing from robot obsevation resolution to policy image resolution
     image = image.permute(2, 0, 1)
     dims = (resize_dims[1], resize_dims[2])
+    if image.shape[1] == dims[0] and image.shape[2] == dims[1]:
+        return image
     # Add batch dimension for interpolate: (C, H, W) -> (1, C, H, W)
     image_batched = image.unsqueeze(0)
     # Interpolate and remove batch dimension: (1, C, H, W) -> (C, H, W)
@@ -162,7 +164,7 @@ def prepare_raw_observation(
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(image_dict[key], policy_image_features[key].shape)
         for key in image_keys
     }
 
