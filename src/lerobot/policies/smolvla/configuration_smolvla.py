@@ -106,6 +106,13 @@ class SmolVLAConfig(PreTrainedConfig):
     self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
     expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
 
+    # Precision the action expert weights are stored and updated in.
+    #   "bfloat16" (default): original behavior, nothing is cast. The expert inherits bfloat16 from the SmolVLM2
+    #       text config, except the re-created cross-attention k_proj/v_proj layers, which are float32.
+    #   "float32": the whole expert is float32, so small optimizer updates are not rounded away.
+    # Saved in config.json. Checkpoints from before this option have no such key and load as "bfloat16".
+    expert_dtype: str = "bfloat16"
+
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
@@ -121,6 +128,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if self.expert_dtype not in ("bfloat16", "float32"):
+            raise ValueError(f"`expert_dtype` must be 'bfloat16' or 'float32'. Got '{self.expert_dtype}'.")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

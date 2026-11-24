@@ -72,6 +72,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        expert_dtype: str = "bfloat16",
     ):
         super().__init__()
         if load_vlm_weights:
@@ -124,6 +125,10 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
+        # "bfloat16" deliberately casts nothing, to keep the original mixed bfloat16/float32 expert. Done before
+        # weights are loaded, so checkpoint weights are copied into the requested precision.
+        if expert_dtype == "float32":
+            self.lm_expert.to(dtype=torch.float32)
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
